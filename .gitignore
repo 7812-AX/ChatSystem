@@ -1,0 +1,22 @@
+# 编译产物
+*.o
+*.out
+chat_server
+chat_server_*
+echo_server_*
+chat_loadgen
+chat_loadgen_*
+
+# 临时文件
+*.txt
+*.log
+*.data
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
