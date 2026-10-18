@@ -1,22 +1,22 @@
-# 编译产物
+# 构建目录与产物
+/build/
+/build-*/
+/cmake-build-*/
 *.o
-*.out
+*.obj
+*.a
+*.so
+*.dylib
 chat_server
-chat_server_*
-echo_server_*
 chat_loadgen
-chat_loadgen_*
+r4_stale_event
 
-# 临时文件
-*.txt
+# 本地配置与运行输出
+.env
 *.log
-*.data
-/tmp/
 
-# IDE
+# IDE / 系统
 .vscode/
 .idea/
 *.swp
-
-# 系统
 .DS_Store

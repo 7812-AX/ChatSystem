@@ -1,31 +1,85 @@
--- M5 数据持久化迁移文件 v001
--- 创建 friendships + messages 两表（可重放/幂等）
--- 执行：mysql -u root -p chat_db < 001_xxx.sql
--- 🧠 填空规则：🧠=常规（应会） 💡=提示引导 🔑=关键难点（卡住问 AI）
+-- ChatSystem 数据库初始化脚本
+--
+-- 用法（需要 MySQL 管理员权限；脚本会重建三张表）：
+--   sudo mysql < scripts/init_db.sql
+--
+-- 脚本创建：
+--   - 数据库 chat_db
+--   - 本地账号 chat_user / chat_password（仅供开发演示）
+--   - users / friendships / messages 三张表
+--   - 14 个演示账号（alice、bob、u1..u12）
+--
+-- 注意：演示账号口令为明文，仅用于本地开发与压测，不可用于生产。
 
--- 🧠 可重放第一步：先删旧表（幂等关键）
--- 💡 思考：为什么后删 friendships？（外键视角：谁依赖谁）
+CREATE DATABASE IF NOT EXISTS chat_db
+    DEFAULT CHARACTER SET utf8mb4
+    DEFAULT COLLATE utf8mb4_unicode_ci;
+
+-- 服务端通过 TCP 连接 127.0.0.1，两个 host 形式都建，避免 localhost 解析差异
+CREATE USER IF NOT EXISTS 'chat_user'@'localhost' IDENTIFIED BY 'chat_password';
+CREATE USER IF NOT EXISTS 'chat_user'@'127.0.0.1' IDENTIFIED BY 'chat_password';
+-- 账号已存在时也把口令对齐到演示默认值，保证重复执行后能直接启动
+ALTER USER 'chat_user'@'localhost' IDENTIFIED BY 'chat_password';
+ALTER USER 'chat_user'@'127.0.0.1' IDENTIFIED BY 'chat_password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON chat_db.* TO 'chat_user'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE ON chat_db.* TO 'chat_user'@'127.0.0.1';
+FLUSH PRIVILEGES;
+
+USE chat_db;
+
+-- 先删有引用关系的表，再删被引用表；本脚本用于可重复的本地初始化
 DROP TABLE IF EXISTS messages;
 DROP TABLE IF EXISTS friendships;
+DROP TABLE IF EXISTS users;
 
--- ==================== friendships 好友关系表 ====================
--- 决策：单向发起（无状态机）；UNIQUE(user_id,friend_id) 防 A→B 重复；该索引覆盖"我的好友列表"
+-- ==================== users ====================
+
+CREATE TABLE users (
+    id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username    VARCHAR(64)  NOT NULL,
+    password    VARCHAR(255) NOT NULL,
+    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_username (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
+
+-- ==================== friendships ====================
+
+-- 单向边：A→B 与 B→A 各一行。UNIQUE 防止同一方向重复添加；
+-- (user_id, friend_id) 索引同时覆盖「我的好友列表」查询。
 CREATE TABLE friendships (
-    id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,      -- 🧠 主键类型（对齐 M2 users.id）
-    user_id     INT UNSIGNED NOT NULL,                        -- 💡 发起方（users.id）
-    friend_id   INT UNSIGNED NOT NULL,                        -- 💡 被添加方（users.id）
-    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,  -- 🧠 默认当前时间
-    UNIQUE KEY uk_user_friend (user_id, friend_id)            -- 🔑 防重复 A→B 的约束类型
+    id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id     INT UNSIGNED NOT NULL,
+    friend_id   INT UNSIGNED NOT NULL,
+    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_user_friend (user_id, friend_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='好友关系表';
 
--- ==================== messages 聊天消息表 ====================
--- 决策：BIGINT 主键预留；content 对齐 M4 MAX_LINE=1024；最近N条 ORDER BY id DESC
---       联合索引 (sender_id,receiver_id,id) 覆盖「A↔B 最近N条」查询
+-- ==================== messages ====================
+
+-- id 自增即时间序；联合索引覆盖「A↔B 最近 N 条」的等值 + 排序查询。
 CREATE TABLE messages (
-    id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,   -- 💡 消息量大，选 BIGINT 预留
-    sender_id   INT UNSIGNED NOT NULL,                        -- 🧠 发送方（users.id）
-    receiver_id INT UNSIGNED NOT NULL,                        -- 🧠 接收方（users.id）
-    content     VARCHAR(2048) NOT NULL,                       -- 🧠 对齐 M4 MAX_LINE 的最大长度类型
-    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    KEY idx_sender_receiver_id (sender_id, receiver_id, id)   -- 🔑 联合索引三列（纯转发查询）
+    id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    sender_id   INT UNSIGNED    NOT NULL,
+    receiver_id INT UNSIGNED    NOT NULL,
+    content     VARCHAR(2048)   NOT NULL,
+    created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_sender_receiver_id (sender_id, receiver_id, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='聊天消息表';
+
+-- ==================== 演示账号 ====================
+
+INSERT INTO users (username, password) VALUES
+    ('alice', 'pass123'),
+    ('bob',   'pass456'),
+    ('u1',    'pass123'),
+    ('u2',    'pass123'),
+    ('u3',    'pass123'),
+    ('u4',    'pass123'),
+    ('u5',    'pass123'),
+    ('u6',    'pass123'),
+    ('u7',    'pass123'),
+    ('u8',    'pass123'),
+    ('u9',    'pass123'),
+    ('u10',   'pass123'),
+    ('u11',   'pass123'),
+    ('u12',   'pass123');

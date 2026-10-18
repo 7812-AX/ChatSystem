@@ -1,56 +1,174 @@
+# 架构与并发设计
 
-ChatSystem 架构设计
-总体架构
-采用 Reactor 模式 + 线程池：
+## 1. 目标与边界
 
-Main Thread：epoll 监听网络事件（EPOLLIN/EPOLLOUT/EPOLLHUP/EPOLLERR）
-Worker Threads：线程池处理业务逻辑 + 数据库访问
-网络层 (M1-M3)
-epoll 边缘触发 (ET)
-单次 EPOLLIN 必须循环读至 EAGAIN（否则漏数据）
-单次 EPOLLOUT 必须循环写至 EAGAIN（否则粘包）
-EPOLLHUP/EPOLLERR 触发连接清理
-连接管理
+ChatSystem 是一个面向学习与演示的 TCP 即时通信服务端，目标是把以下几条工程约束落到代码里：
 
-std::unordered_map<int, ClientState> clients;  // fd -> state
-存储每个连接的读缓冲、写缓冲、登录用户名
-异常断开时双向清理：clients.erase(fd) + epoll_ctl(DEL)
-并发层 (M4)
-ThreadPool 设计
-任务队列：std::queue<std::function<void()>>
-同步机制：mutex 保护队列，condition_variable 等待任务
-生产者：Main Thread 收到完整请求后 push
-消费者：Worker 线程 pop + 执行业务 + 回写响应
-执行流程
+- 单机高并发连接下的 I/O 路径要尽量少的系统调用和线程切换；
+- 同一条连接的请求必须按到达顺序处理；
+- 连接断开、fd 复用、慢客户端等边界不能把消息写到错误的连接上；
+- 数据库访问不能退化成全局单连接串行化；
+- 停机时在途任务要能完成，资源释放顺序不能反。
 
-Client -> [EPOLLIN] -> Main Thread 读数据 -> 判断完整性
-   -> push 任务队列 -> Worker pop -> 业务逻辑 -> 写响应到缓冲
-   -> [EPOLLOUT] -> Main Thread 发送 -> Client
-业务层 (M4-M5)
-支持的功能
-用户注册 / 登录
-添加好友（双向关系）
-广播消息（向所有在线用户）
-私聊消息（点对点 + 持久化）
-历史消息查询（最近 20 条）
-协议格式
+项目不包含注册、好友申请、群聊、离线消息、集群等完整产品能力；当前文本协议只开放登录、私聊和广播。
 
-请求：command:ARG1 ARG2\n
-响应：[ChatSystem] message\n
-持久化层 (M5)
-表结构
-users：id, username, password (明文，仅测试)
-friendships：user_id, friend_id (双向存储)
-messages：id, sender_id, receiver_id, content, created_at
-索引设计
-friendships: (user_id, friend_id) 联合唯一索引
-messages: (receiver_id, id) 联合索引 (支持 ORDER BY id DESC LIMIT 20)
-性能优化方向
-已完成
-epoll ET 减少系统调用
-线程池复用线程
-Prepared Statement 预编译
-待优化 (M11-M12)
-HTTP 接口支持 (M11)
-MySQL 连接池 (M12)
-更多细节见各模块源码注释。
+## 2. 线程模型
+
+```text
+┌──────────────────────────────────────────────┐
+│ 主线程：EventLoop                            │
+│ - epoll_wait                                 │
+│ - accept                                     │
+│ - recv + 行分帧                              │
+│ - 把完整行投递给线程池                        │
+│ - 执行所有 send / EPOLLOUT 补发               │
+└───────────────┬──────────────────────────────┘
+                │ 任务队列（上限 4096）
+┌───────────────▼──────────────────────────────┐
+│ 6 个 worker：ThreadPool                      │
+│ - AuthService：登录校验                      │
+│ - MessageService：广播 / 私聊                │
+│ - 通过连接池访问 MySQL                       │
+└───────────────┬──────────────────────────────┘
+                │ borrow / return
+┌───────────────▼──────────────────────────────┐
+│ MySQL 连接池：6 条连接                       │
+└──────────────────────────────────────────────┘
+```
+
+事件循环是唯一执行 `recv` 和 `send` 的线程；worker 只做业务计算、数据库访问和“把报文放进目标连接的出站队列”。这样网络 I/O 不需要在多个线程之间分摊 fd 所有权，也避免了多写者交叉写同一条 TCP 字节流。
+
+## 3. 连接生命周期
+
+### 3.1 accept 与登记
+
+`EventLoop::handle_accept` 接受新 fd 后，由 `TcpConnection::create` 分配一个 `ConnectionId`，创建 `Connection` 对象，并以身份为键登记到注册表：
+
+```text
+ConnectionId (uint64, 单调递增，永不复用)
+        │
+        ▼
+unordered_map<ConnectionId, shared_ptr<Connection>>
+        │
+        └── Connection 持有 fd 的所有权
+```
+
+注册表存 `shared_ptr<Connection>`，它同时是 fd 号的持有者。连接断开时只从注册表摘除身份并做逻辑关闭，不直接 `close(fd)`；真正的 `close` 发生在最后一个 `shared_ptr` 析构时。
+
+### 3.2 为什么需要 ConnectionId
+
+如果任务只捕获裸 fd，会出现下面的交错：
+
+```text
+事件循环：recv 到一行，投递任务（捕获 fd=7）
+事件循环：对端关闭，close(7)
+事件循环：accept 新连接，内核再次分配 fd=7
+worker：任务开始执行，向 fd=7 写响应
+```
+
+最后一步会把旧连接的响应写进新连接。发送返回成功、日志也没有异常，问题很难从现象定位。
+
+引入身份与 `shared_ptr` 后，任务在排队期间持有 `Connection` 对象，fd 号不可能被归还内核，下一次 `accept` 也就拿不到同一个号。这不是把竞态窗口缩小，而是把“fd 是否被复用”从时序问题里删掉。
+
+所有跨层传递连接引用的接口都使用 `ConnectionId` 而不是 `int fd`；迟到任务按身份查注册表，查不到就安全丢弃。
+
+### 3.3 读、分帧与同连接串行化
+
+`EventLoop` 每次 `EPOLLIN` 都循环 `recv` 到 `EAGAIN`，把字节追加到该连接的入站缓冲，再按 `\n` 切出完整行。半包留在缓冲里等下一次可读；单行超过 4096 字节时进入丢弃态，直到遇到下一个换行。
+
+切出的行进入该连接的 `pending_lines_` FIFO。`enqueue_lines` 返回 true 时，事件循环才向线程池提交一个 drain 任务；如果该连接已经有一个 drain 任务在跑，新行由正在运行的 worker 顺带消费。于是：
+
+- 同一条连接内，请求按到达顺序处理；
+- 同一条连接最多只有一个 worker 任务在途，不会出现两个 worker 同时处理同一用户的登录/消息；
+- 不同连接之间仍然并行。
+
+这部分状态由事件循环（push）和 worker（pop）共同访问，因此 `pending_lines_` 与 `worker_active_` 由互斥锁保护。入站字节缓冲只被事件循环读写，不需要加锁。
+
+### 3.4 发送路径与背压
+
+worker 生成响应后调用 `TcpConnection::add_to_send_queue`，最终落到 `Connection::add_to_queue_out`：
+
+1. 把完整报文追加到该连接的 `out_buf_`；
+2. 如果 `EPOLLOUT` 尚未挂上，用 `epoll_ctl(MOD)` 挂上；
+3. 返回 true 表示“已入队”，后续发送由事件循环负责。
+
+事件循环处理 `EPOLLOUT` 时调用 `send_all_queue_msg`，循环发送到 `EAGAIN`。如果只发出去一部分，剩余字节留在队首，`EPOLLOUT` 继续挂着，等内核腾出空间再补发。
+
+这条路径有三个约束：
+
+- 全项目只有事件循环线程调用 `send`，单连接单写者；
+- 出站队列上限 4 MiB，超过即认定客户端“只发不收”，记录日志并断开；
+- worker 不等待发送完成，入队即返回，慢客户端不会把 worker 卡在 `send` 上。
+
+## 4. 数据库访问
+
+### 4.1 连接池
+
+服务启动时创建固定数量的 MySQL 连接，放入空闲队列。DAO 通过 `PooledConnection` 守卫借用：
+
+```cpp
+PooledConnection guard = pool_.borrow();
+MYSQL* conn = guard.get();
+if (conn == nullptr) {
+    // 借用超时或池已停止
+}
+// guard 析构时自动归还
+```
+
+- 借用超时 100 ms，避免 worker 无限等待；
+- 归还前探活，坏连接丢弃后补建；
+- 连接池容量与 worker 数独立配置，默认都是 6；
+- 启动阶段单条连接失败会重试，仍失败则跳过并减少池容量，不让整个进程起不来。
+
+连接池消除了早期“全局单连接 + 全局锁”的串行化：多个 worker 可以同时执行不同查询，MySQL 侧也能并行处理。
+
+### 4.2 Prepared Statement
+
+所有带用户输入的 SQL 都使用 `mysql_stmt_prepare` + `mysql_stmt_bind_param`，不拼接 SQL 字符串。登录查询只返回 `id, password`，用户名不存在与密码错误对外统一为同一条失败提示，不泄露账号是否存在。
+
+### 4.3 私聊落库顺序
+
+私聊路径是“先落库，后投递”：
+
+```text
+校验发送方已登录
+  → 查目标连接身份
+  → 查双方 user_id（登录时写入缓存）
+  → INSERT messages
+  → 向目标连接入队
+  → 向发送方回执“已受理”
+```
+
+落库失败时向发送方返回“消息未保存”，不投递；落库成功但目标在数据库操作期间断开时，消息可能投递失败，发送方收到“消息已保存，本次投递发生异常，送达状态未确认”。这里的返回值只表示“入队是否成功”，不是端到端 ACK。
+
+## 5. 会话与顶号
+
+`SessionStore` 维护两张表：
+
+- `ConnectionId -> username`
+- `username -> ConnectionId`
+
+登录成功后先写 `UserIdCache`，再绑定会话路由；同一账号重复登录时，`bind_login` 返回旧连接身份，`AuthService` 断开旧连接。断开旧连接使用的是身份而不是 fd，因此迟到清理不会落到新连接上。
+
+会话表与连接注册表各自用互斥锁保护。广播时先在锁内拷贝在线身份列表，再在锁外逐个入队，避免慢客户端持锁阻塞其他连接。
+
+## 6. 停机
+
+`SIGINT` / `SIGTERM` 只把全局运行标志置 false；`epoll_wait` 被信号打断后，事件循环检查双退出条件并返回。主线程随后按顺序清理：
+
+```text
+EventLoop::run() 返回
+  → ThreadPool::stop()：置停止标志，等队列中的任务执行完，join 所有 worker
+  → MysqlConnectionPool::stop()：唤醒借用等待者，关闭空闲连接
+  → 进程退出
+```
+
+必须先停线程池再停连接池：worker 在途任务可能仍持有数据库连接，提前关闭连接池会让归还路径拿到已释放的句柄。
+
+## 7. 已知取舍
+
+- 单事件循环：实现简单、无 fd 跨线程竞争，但单核 I/O 是上限；进一步扩展需要多 Reactor 或 `SO_REUSEPORT` 多进程。
+- 每连接一个 drain 任务：保证顺序，但一条连接的业务慢调用会阻塞该连接后续请求；这是“同连接有序”的代价。
+- 出站队列按字节限流，不按消息条数；大报文和小报文的排队行为不同。
+- 私聊落库是同步的，数据库延迟会直接反映到私聊吞吐上；异步写队列可解耦，但会引入丢失窗口和顺序问题。
+- 演示认证使用明文口令，仅用于本地开发；生产需要加盐哈希、TLS 和完整的账号体系。

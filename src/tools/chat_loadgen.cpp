@@ -1,5 +1,8 @@
-// M10-A1 D1 骨架：协议感知、非交互式 TCP 负载驱动器。
-// D1 只冻结设计；socket、线程和协议实现放到 D2。
+// chat_loadgen — 协议感知的非交互式 TCP 负载驱动器。
+//
+// 每条并发连接独占一个 worker 线程、一个账号和一条长连接，按固定次数重复
+// 登录请求；worker 只在本地累计结果，主线程汇总后输出吞吐、错误分类与
+// 成功请求的 P50/P95/P99。并发数不能超过账号数。
 
 #include <cerrno>
 #include <cstring>
@@ -26,12 +29,8 @@
 
 #include <thread>       //main 线程注册
 
-// constexpr std::vector<Credential> account_pool;
-
 enum class WorkloadKind {
     Login,
-    Broadcast,
-    PrivateMessage,
 };
 
 struct Credential {
@@ -68,7 +67,7 @@ double percentile_ms(std::vector<double> samples, double percentile) {
 
     //计算分位 percentile * vector.size() --> 向上取整ceil
     const auto rank = static_cast<std::size_t>(std::ceil(percentile * static_cast<double>(samples.size())));
-    
+
     //真实索引 rank-1 ，min()：防止下标溢出，rank==0：防止无符号整数下溢至负数
     const std::size_t index = rank == 0 ? 0 : std::min(rank - 1, samples.size() - 1);
 
@@ -90,7 +89,7 @@ std::size_t parse_positive(std::string_view text,const char* field_name){
     return value;
 }
 
-// TODO（学生）：把固定的命令行/配置输入解析为 DriverConfig。
+// 解析并校验命令行参数；账号池必须覆盖全部并发连接。
 DriverConfig parse_args(int argc, char* argv[]){
     if(argc < 7) {throw std::invalid_argument(
         "用法: chat_loadgen HOST PORT CONCURRENCY "
@@ -146,8 +145,7 @@ DriverConfig parse_args(int argc, char* argv[]){
     return config;
 }
 
-// TODO（学生，D2）：独占一条连接，执行确定性的负载，
-// 返回本地计数；worker 不直接更新共享计数。
+// 独占一条连接执行固定负载，返回本地计数；worker 不直接更新共享计数。
 WorkerResult run_worker(const DriverConfig& config, std::size_t worker_id){
     WorkerResult res{};
     res.attempts = config.requests_per_connection;
@@ -347,7 +345,7 @@ WorkerResult run_worker(const DriverConfig& config, std::size_t worker_id){
     return res;
 }
 
-// TODO（学生）：在驱动器主线程汇总各 worker 的本地结果。
+// 主线程汇总各 worker 的本地结果，并校验计数一致性。
 WorkerResult merge_results(const std::vector<WorkerResult>& results){
     WorkerResult worker_total{};
 
@@ -374,7 +372,6 @@ WorkerResult merge_results(const std::vector<WorkerResult>& results){
     return worker_total;
 }
 
-// TODO（学生）：串起参数解析、worker 启动、结果汇总和摘要输出。
 int main(int argc, char* argv[]){
     //外层捕获异常参数
     try{
@@ -398,7 +395,7 @@ int main(int argc, char* argv[]){
 
         //汇总结果--输出
         WorkerResult total_res = merge_results(res);
-        
+
         double error_rate = 100.0 * static_cast<double>(total_res.failures) / static_cast<double>(total_res.attempts);  //错误率
 
         const auto elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count();     //请求响应总时长
@@ -432,9 +429,3 @@ int main(int argc, char* argv[]){
 
     return 0;
 }
-
-// D2 实现前要设计的测试用例：
-// 1. concurrency=1、一个有效固定账号 → 一次成功登录。
-// 2. 格式错误/未知账号响应 → 协议或登录失败，不能计为成功。
-// 3. 人为触发截止时间 → timeout、failures 都增加。
-// 4. 相同配置运行两次 → 账号/消息序列和结果字段结构一致。
